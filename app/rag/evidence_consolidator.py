@@ -10,8 +10,13 @@ from app.rag.llm_client import safe_completion_json
 
 ConsolidationStatus = Literal[
     "supported",
+    "resolved",
     "contradictory",
     "insufficient",
+]
+
+ResolutionBasis = Literal[
+    "declared_attribute_precedence",
 ]
 
 
@@ -19,8 +24,7 @@ class AtomicFact(BaseModel):
     """A single grounded fact plus structural provenance.
 
     The provenance fields describe how and where the fact was stated.
-    They are extracted now and will be used by the deterministic resolver
-    in Phase 2. Resolution itself does not happen in this model.
+    Resolution is performed separately by deterministic code.
     """
 
     statement: str
@@ -53,16 +57,14 @@ class FactExtractionResult(BaseModel):
 
 
 class ConsolidationGroup(BaseModel):
-    """Backward-compatible outward contract used until Phase 2.
-
-    ``status`` remains temporarily because the answer-generation path still
-    consumes it. Phase 2 will replace LLM-derived conflict status with the
-    deterministic resolver while preserving the richer facts.
-    """
+    """Deterministic requirement-level consolidation result."""
 
     group: str
     status: ConsolidationStatus = "insufficient"
+    resolution_basis: ResolutionBasis | None = None
+    resolved_fact: AtomicFact | None = None
     facts: list[AtomicFact] = Field(default_factory=list)
+    raw_candidates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _UNIVERSAL_STOPWORDS = {
@@ -315,6 +317,91 @@ def _normalize_model_result(group: str, items: list[dict], raw: object) -> dict:
     }
 
 
+def _normalized_value(value: str) -> str:
+    """Normalize only for equality checks; preserve the source value itself."""
+
+    return re.sub(r"\s+", " ", value.strip()).casefold()
+
+
+def _distinct_value_keys(facts: list[AtomicFact]) -> set[tuple[str, str]]:
+    """Return distinct (attribute, value) pairs without rewriting source facts."""
+
+    keys: set[tuple[str, str]] = set()
+    for fact in facts:
+        keys.add((fact.attribute.strip().casefold(), _normalized_value(fact.value)))
+    return keys
+
+
+def _resolve_requirement_facts(
+    facts: list[AtomicFact],
+) -> tuple[ConsolidationStatus, ResolutionBasis | None, AtomicFact | None]:
+    """Resolve one requirement deterministically from already-extracted facts.
+
+    V1 policy: a directly declared attribute is the system-of-record when it
+    conflicts with narrative references. This deliberately follows the
+    benchmark convention observed in the current corpus, including cases where
+    a narrative section contains an explicit ``Present`` scope. The trade-off
+    is intentional and documented here rather than hidden in the LLM prompt.
+
+    Unknown/ambiguous provenance never triggers automatic resolution when
+    multiple values disagree.
+    """
+
+    # Extractive fallback spans may intentionally carry ``value_type=unknown``
+    # and an empty attribute. They are preserved as raw evidence, but they do
+    # not have enough structure to participate in semantic resolution.
+    resolvable_facts = [
+        fact
+        for fact in facts
+        if fact.attribute.strip() and fact.value.strip()
+    ]
+
+    if not resolvable_facts:
+        return "insufficient", None, None
+
+    non_empty_attributes = {
+        fact.attribute.strip().casefold()
+        for fact in resolvable_facts
+    }
+
+    # One requirement is expected to describe one factual attribute. If
+    # extraction produces unrelated attributes, do not guess which one the
+    # resolver should select.
+    if len(non_empty_attributes) > 1:
+        return "contradictory", None, None
+
+    value_keys = _distinct_value_keys(resolvable_facts)
+
+    if len(value_keys) == 1:
+        return "supported", None, resolvable_facts[0]
+
+    # Ambiguous provenance must not silently resolve a disagreement.
+    if any(f.value_type == "unknown" for f in resolvable_facts):
+        return "contradictory", None, None
+
+    declared = [
+        fact
+        for fact in resolvable_facts
+        if fact.value_type == "declared_attribute"
+    ]
+    narrative = [
+        fact
+        for fact in resolvable_facts
+        if fact.value_type == "narrative_reference"
+    ]
+
+    declared_keys = _distinct_value_keys(declared)
+
+    # A single declared value takes precedence over any narrative value(s).
+    # Keep every fact intact; only the resolved_fact/status changes.
+    if len(declared_keys) == 1 and narrative:
+        resolved = next(iter(declared), None)
+        if resolved is not None:
+            return "resolved", "declared_attribute_precedence", resolved
+
+    return "contradictory", None, None
+
+
 def _merge_extractive_fallback(
     model_result: dict,
     extractive_spans: list[dict],
@@ -440,6 +527,32 @@ def consolidate_evidence(
                 ranked_items,
             )
 
-        consolidated[group] = merged
+        fact_models = []
+        for fact_data in merged.get("facts", []):
+            try:
+                fact_models.append(AtomicFact.model_validate(fact_data))
+            except Exception:
+                continue
+
+        status, resolution_basis, resolved_fact = _resolve_requirement_facts(
+            fact_models
+        )
+
+        consolidated[group] = {
+            "group": group,
+            "status": status,
+            "resolution_basis": resolution_basis,
+            "resolved_fact": (
+                resolved_fact.model_dump()
+                if resolved_fact is not None
+                else None
+            ),
+            "facts": [fact.model_dump() for fact in fact_models],
+            # Keep the existing retrieval evidence contract for downstream
+            # callers. Phase 3 will teach generation how to consume the new
+            # resolution fields explicitly.
+            "evidence": merged.get("evidence", ranked_items),
+            "raw_candidates": ranked_items,
+        }
 
     return consolidated
