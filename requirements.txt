@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-dotenv
+pydantic
+chromadb
+sentence-transformers
+litellm
+tenacity
+tqdm
