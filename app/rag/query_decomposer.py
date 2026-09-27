@@ -9,217 +9,107 @@
 from app.rag.llm_client import safe_completion_json
 
 
-def decompose_query(query: str) -> list[str]:
+def decompose_query_structured(query: str) -> list[dict]:
     """
-    Decompose a user query into the smallest set of independent
-    factual evidence requirements needed to answer it.
+    Decompose a query into independent, domain-agnostic evidence
+    requirements while preserving explicitly requested entities.
 
-    The decomposition is domain-agnostic. It does not assume
-    anything about the type of entities, documents, or data
-    being queried.
+    Each item has:
+        - requirement: the complete retrievable factual requirement
+        - entities: explicitly identified entities/concepts needed
+          for that requirement
     """
 
     prompt = f"""
 You are a query decomposition system for a general-purpose
 enterprise RAG application.
 
-Your task is to decompose the user's question into the smallest
-set of independent factual evidence requirements needed to
-answer it.
+Decompose the user's question into the smallest set of independent
+factual evidence requirements needed to answer it.
 
-The requirements will be used independently for document
-retrieval and evidence verification.
+The decomposition must be completely domain-agnostic. An entity may
+be a person, product, project, company, location, document, metric,
+organization, object, or anything else explicitly identified by the user.
 
-IMPORTANT PRINCIPLE:
+RULES:
+1. Create one requirement for each independently retrievable fact.
+2. If multiple explicitly identified entities each require the same
+   type of fact, create one requirement per entity.
+3. Preserve the complete information requirement in every requirement,
+   including dates, metrics, attributes, categories, locations,
+   statuses, and other constraints.
+4. Do not perform calculations, comparisons, ranking, filtering,
+   aggregation, or answer the question.
+5. Do not invent entities or facts.
+6. Each requirement must stand alone without the original query.
+7. `entities` must contain only entities explicitly identified in the
+   requirement/query that are useful for targeted retrieval.
+8. If no explicit entity is present, return an empty entities list.
+9. Preserve the user's terminology whenever possible.
 
-Each subquery should represent ONE independently retrievable
-and verifiable piece of evidence.
-
-The decomposition must be completely domain-agnostic.
-Do not assume the query is about employees, companies,
-finance, products, projects, contracts, or any particular
-domain.
-
-GENERAL RULES:
-
-1. Identify every factual piece of evidence required to answer
-   the user's question.
-
-2. If multiple explicitly identified entities are each being
-   asked for the same type of information, create one subquery
-   per entity.
-
-3. Preserve the complete information requirement in every
-   subquery, including:
-   - entity
-   - date or time period
-   - metric or attribute
-   - category
-   - location
-   - status
-   - other constraints specified by the user
-
-4. If a question requires comparing, ranking, filtering,
-   aggregating, or calculating across multiple entities,
-   decompose it into the independent factual requirements
-   needed to perform that operation.
-
-5. Do NOT perform calculations, comparisons, ranking,
-   aggregation, or filtering yourself.
-
-6. Do NOT answer the user's question.
-
-7. Do NOT invent facts or requirements that are not implied
-   by the user's question.
-
-8. Do NOT create unnecessary subqueries.
-
-9. If one piece of evidence is sufficient to answer the
-   question, return exactly one subquery.
-
-10. If multiple pieces of evidence are independently required,
-    return one subquery for each piece.
-
-11. When multiple entities are explicitly named and each entity
-    requires independent evidence, do not keep those entities
-    together in one subquery.
-
-12. When a question asks for a comparison or calculation,
-    retrieve the underlying facts separately rather than
-    attempting to encode the comparison itself into every
-    retrieval query.
-
-13. Each subquery must be understandable on its own without
-    relying on the original user query.
-
-14. Preserve the user's terminology whenever possible.
-
-15. Do not rewrite the request into a broader or more general
-    question.
-
-DOMAIN-NEUTRAL EXAMPLE 1:
-
-User query:
-"What are the release dates of Product A, Product B,
-and Product C?"
-
-Correct decomposition:
-
-[
-    "What is the release date of Product A?",
-    "What is the release date of Product B?",
-    "What is the release date of Product C?"
-]
-
-DOMAIN-NEUTRAL EXAMPLE 2:
-
-User query:
-"Which of Product A, Product B, and Product C was released
-first?"
-
-Correct decomposition:
-
-[
-    "What is the release date of Product A?",
-    "What is the release date of Product B?",
-    "What is the release date of Product C?"
-]
-
-The decomposition retrieves the facts required for the
-downstream comparison. Do not perform the comparison.
-
-DOMAIN-NEUTRAL EXAMPLE 3:
-
-User query:
-"How did Metric X change between 2022 and 2023?"
-
-Correct decomposition:
-
-[
-    "What was Metric X in 2022?",
-    "What was Metric X in 2023?"
-]
-
-DOMAIN-NEUTRAL EXAMPLE 4:
-
-User query:
-"Which locations had a value above 100 in 2023?"
-
-Correct decomposition:
-
-[
-    "What was the value for each relevant location in 2023?"
-]
-
-Do not attempt to determine which locations satisfy the
-condition. Retrieve the underlying evidence needed for the
-downstream filtering operation.
-
-DOMAIN-NEUTRAL EXAMPLE 5:
-
-User query:
-"Who is responsible for Project A and what is its current
-status?"
-
-Correct decomposition:
-
-[
-    "Who is responsible for Project A?",
-    "What is the current status of Project A?"
-]
-
-DOMAIN-NEUTRAL EXAMPLE 6:
-
-User query:
-"Summarize Project A."
-
-Correct decomposition:
-
-[
-    "What information is available about Project A?"
-]
-
-Do not unnecessarily split a simple request into many
-subqueries.
-
-OUTPUT REQUIREMENTS:
-
-Return ONLY valid JSON.
-
-The JSON must have exactly this structure:
-
+EXAMPLE:
+User: "What are the release dates of Product A, Product B, and Product C?"
+Output:
 {{
-    "subqueries": [
-        "subquery 1",
-        "subquery 2"
-    ]
+  "requirements": [
+    {{"requirement": "What is the release date of Product A?", "entities": ["Product A"]}},
+    {{"requirement": "What is the release date of Product B?", "entities": ["Product B"]}},
+    {{"requirement": "What is the release date of Product C?", "entities": ["Product C"]}}
+  ]
+}}
+
+Return ONLY valid JSON in exactly this structure:
+{{
+  "requirements": [
+    {{"requirement": "...", "entities": ["..."]}}
+  ]
 }}
 
 User query:
-
 {query}
 """
 
     data = safe_completion_json(
         prompt,
-        max_tokens=512,
-        fallback={"subqueries": [query]},
+        max_tokens=768,
+        fallback={"requirements": [{"requirement": query, "entities": []}]},
     )
 
-    subqueries = data.get("subqueries", [])
+    requirements = data.get("requirements", [])
 
-    if not isinstance(subqueries, list) or not subqueries:
-        subqueries = [query]
+    if not isinstance(requirements, list) or not requirements:
+        return [{"requirement": query, "entities": []}]
 
-    cleaned_subqueries = []
+    cleaned = []
 
-    for subquery in subqueries:
-        if not isinstance(subquery, str):
+    for item in requirements:
+        if not isinstance(item, dict):
             continue
 
-        subquery = subquery.strip()
+        requirement = item.get("requirement")
+        entities = item.get("entities", [])
 
-        if subquery:
-            cleaned_subqueries.append(subquery)
+        if not isinstance(requirement, str) or not requirement.strip():
+            continue
 
-    return cleaned_subqueries or [query]
+        if not isinstance(entities, list):
+            entities = []
+
+        cleaned_entities = []
+        for entity in entities:
+            if isinstance(entity, str) and entity.strip():
+                value = entity.strip()
+                if value not in cleaned_entities:
+                    cleaned_entities.append(value)
+
+        cleaned.append({
+            "requirement": requirement.strip(),
+            "entities": cleaned_entities,
+        })
+
+    return cleaned or [{"requirement": query, "entities": []}]
+
+
+def decompose_query(query: str) -> list[str]:
+    """Backward-compatible string-only decomposition API."""
+    return [item["requirement"] for item in decompose_query_structured(query)]
