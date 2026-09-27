@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from app.rag.answer_generator import generate_answer
+from app.rag.evidence_consolidator import consolidate_evidence
 from app.rag.llm_client import safe_completion_json
 
 
@@ -75,36 +76,27 @@ def load_tests(path: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------
-# Employee helper
-# ---------------------------------------------------------
-
-def get_employee_name(source: str) -> str:
-    filename = (
-        source
-        .replace("\\", "/")
-        .split("/")[-1]
-    )
-    return filename.removesuffix(".md")
-
-
-# ---------------------------------------------------------
-# Reconstruct answer-generation context
+# Domain-agnostic evidence reconstruction
 # ---------------------------------------------------------
 
 def build_answer_context(result: dict) -> dict[str, list[dict]]:
     """
-    Reconstruct all saved retrieval evidence.
+    Preserve independently retrievable evidence requirements.
 
-    Different employees may satisfy different subqueries.
+    Each generated subquery becomes one evidence group. No assumptions
+    are made about whether a source represents an employee, product,
+    project, ticket, contract, or any other domain entity.
     """
 
     grouped: dict[str, list[dict]] = {}
 
     for subquery_item in result.get("subqueries", []):
-        subquery = subquery_item.get("subquery", "")
+        subquery = subquery_item.get("subquery", "").strip()
 
         if not subquery:
             continue
+
+        group = grouped.setdefault(subquery, [])
 
         for evidence in subquery_item.get("evidence", []):
             if not isinstance(evidence, dict):
@@ -116,158 +108,89 @@ def build_answer_context(result: dict) -> dict[str, list[dict]]:
             if not source or not document:
                 continue
 
-            result_item = {
-                "document": document,
-                "metadata": {
-                    "source": source,
-                },
-                "distance": evidence.get("distance"),
-            }
-
-            employee = get_employee_name(source)
-
-            grouped.setdefault(employee, []).append(
+            group.append(
                 {
                     "subquery": subquery,
-                    "result": result_item,
+                    "result": {
+                        "document": document,
+                        "metadata": {"source": source},
+                        "distance": evidence.get("distance"),
+                    },
                 }
             )
 
     return grouped
 
 
-# ---------------------------------------------------------
-# Query-aware evidence selection
-# ---------------------------------------------------------
-
-def _query_terms(
-    question: str,
-    reference_answer: str = "",
-    generated_answer: str = "",
-) -> set[str]:
-    text = (
-        f"{question} "
-        f"{reference_answer} "
-        f"{generated_answer}"
-    ).lower()
-
-    words = re.findall(r"[a-z0-9]+", text)
-
-    stopwords = {
-        "what", "was", "were", "who", "how", "much", "does", "did",
-        "the", "a", "an", "is", "are", "in", "on", "of", "to", "and",
-        "or", "for", "from", "among", "with", "their", "his", "her",
-        "current", "work", "works", "had", "has", "have", "than",
-        "employee", "employees",
-    }
-
-    return {
-        word
-        for word in words
-        if len(word) > 1 and word not in stopwords
-    }
-
-
-def _rank_evidence(
+def select_evidence_by_subquery(
     grouped_evidence: dict[str, list[dict]],
-    question: str,
-    reference_answer: str = "",
-    generated_answer: str = "",
-    max_items_per_group: int = 2,
+    max_items_per_group: int = 3,
 ) -> dict[str, list[dict]]:
     """
-    Keep the most relevant chunks per group for answer generation/judging.
+    Preserve the top retrieved evidence for every subquery.
 
-    The stored retrieval results remain untouched. This only reduces the
-    prompt supplied to the generation LLM during this baseline evaluation.
+    Retrieval already supplies ranked evidence for each subquery, so
+    baseline evaluation must not replace that ranking with lexical
+    heuristics or cross-group selection.
     """
 
-    terms = _query_terms(
-        question,
-        reference_answer,
-        generated_answer,
-    )
-
-    compact: dict[str, list[dict]] = {}
-
-    for group_key, items in grouped_evidence.items():
-        ranked = []
-
-        for item in items:
-            document = item["result"].get("document", "")
-            subquery = item.get("subquery", "")
-
-            haystack = (
-                f"{group_key} "
-                f"{subquery} "
-                f"{document}"
-            ).lower()
-
-            score = sum(
-                1
-                for term in terms
-                if term in haystack
-            )
-
-            # Small preference for shorter, focused chunks.
-            length_penalty = min(len(document) / 5000, 1.0)
-
-            final_score = score - (0.05 * length_penalty)
-
-            ranked.append(
-                (final_score, item)
-            )
-
-        ranked.sort(
-            key=lambda pair: pair[0],
-            reverse=True,
-        )
-
-        compact[group_key] = [
-            item
-            for _, item in ranked[:max_items_per_group]
-        ]
-
-    return compact
+    return {
+        subquery: items[:max_items_per_group]
+        for subquery, items in grouped_evidence.items()
+        if items
+    }
 
 
 def build_compact_context(
     grouped_evidence: dict[str, list[dict]],
-    question: str,
-    reference_answer: str = "",
-    generated_answer: str = "",
-    max_chars: int = 10000,
+    max_chars: int | None = None,
 ) -> str:
     """
-    Build a bounded judge context.
+    Format exactly the evidence supplied to generation.
 
-    Keeps each group represented while limiting the total prompt size.
+    The judge must see the same evidence set as the generator. No
+    reference-answer or generated-answer-dependent re-ranking occurs.
     """
-
-    selected = _rank_evidence(
-        grouped_evidence,
-        question=question,
-        reference_answer=reference_answer,
-        generated_answer=generated_answer,
-        max_items_per_group=3,
-    )
 
     blocks: list[str] = []
 
-    for group_key, items in selected.items():
+    for group_key, group_data in grouped_evidence.items():
+        # Consolidated evidence representation.
+        if isinstance(group_data, dict) and "facts" in group_data:
+            status = group_data.get("status", "insufficient")
+            blocks.append(
+                f"GROUP: {group_key}\nSTATUS: {status.upper()}"
+            )
+
+            for fact in group_data.get("facts", []):
+                blocks.append(
+                    f"FACT: {fact['statement']}\n"
+                    f"Evidence indices: {fact['evidence_indices']}"
+                )
+
+            for index, item in enumerate(group_data.get("evidence", [])):
+                result = item.get("result", {})
+                source = result.get("metadata", {}).get(
+                    "source", "Unknown source"
+                )
+                filename = source.replace("\\", "/").split("/")[-1]
+                document = str(result.get("document", ""))
+
+                blocks.append(
+                    f"Supporting evidence {index}: {filename}\n"
+                    f"{document[:1800]}"
+                )
+
+            continue
+
+        # Backward-compatible formatting for non-consolidated evidence.
         blocks.append(f"GROUP: {group_key}")
 
-        for item in items:
+        for item in group_data:
             source = item["result"]["metadata"].get(
-                "source",
-                "Unknown source",
+                "source", "Unknown source"
             )
-
-            filename = (
-                source
-                .replace("\\", "/")
-                .split("/")[-1]
-            )
+            filename = source.replace("\\", "/").split("/")[-1]
 
             blocks.append(
                 f"Subquery: {item['subquery']}\n"
@@ -278,7 +201,7 @@ def build_compact_context(
 
     context = "\n\n".join(blocks)
 
-    if len(context) <= max_chars:
+    if max_chars is None or len(context) <= max_chars:
         return context
 
     return context[:max_chars]
@@ -301,8 +224,11 @@ def judge_answer(
     prompt = f"""
 You are an enterprise RAG answer evaluator.
 
-Evaluate ONLY against the reference answer and retrieved evidence.
-Do not use outside knowledge.
+Use the reference answer ONLY as the expected-answer target for
+accuracy and completeness. The reference answer is NOT evidence.
+For groundedness and citation correctness, rely ONLY on the retrieved
+evidence shown below. Do not use the reference answer to support any
+claim. Do not use outside knowledge.
 
 Question:
 {question}
@@ -321,13 +247,18 @@ Score each dimension from 1 to 5:
 - accuracy: factual correctness of every substantive claim.
 - completeness: whether every requested part/entity/value is answered.
 - relevance: whether the answer directly addresses the question.
-- groundedness: whether substantive claims are supported by the evidence.
+- groundedness: whether EVERY substantive claim is directly supported
+  by the retrieved evidence. A claim matching the reference answer but
+  absent from retrieved evidence is NOT grounded.
 - citation_correctness: whether supplied source citations/attributions
-  correctly correspond to the evidence.
-  If no citation/source attribution is present, do not invent one.
+  correctly correspond to the retrieved evidence. If no citation/source
+  attribution is present, do not invent one.
 
-For numerical questions, verify arithmetic.
-For multi-entity/comparative questions, verify every named entity separately.
+For numerical questions, verify arithmetic against retrieved evidence.
+For multi-entity/comparative questions, verify EVERY independent
+subquery/evidence group separately before accepting the final answer.
+If a required group's evidence is missing, the answer cannot receive
+full groundedness for claims that depend on that missing fact.
 Do not penalize concise answers for omitting irrelevant details.
 
 Return ONLY a JSON object matching the required schema.
@@ -389,14 +320,17 @@ def run_one(
     # Stored retrieval results are NOT modified.
     # -----------------------------------------------------
 
-    generation_evidence = _rank_evidence(
+    generation_evidence = select_evidence_by_subquery(
         grouped_evidence,
-        question=test["question"],
-        # IMPORTANT: reference answer is unavailable at inference time.
-        # Do not leak it into generation-time evidence selection.
-        reference_answer="",
-        generated_answer="",
         max_items_per_group=3,
+    )
+
+    # Convert retrieved chunks into atomic, requirement-scoped facts
+    # before generation. No new evidence is created here.
+    generation_evidence = consolidate_evidence(
+        generation_evidence,
+        max_candidates_per_group=3,
+        max_chars_per_candidate=3500,
     )
 
     # print("\n===== GENERATION EVIDENCE =====")
@@ -431,10 +365,7 @@ def run_one(
 
     evidence_context = build_compact_context(
         generation_evidence,
-        question=test["question"],
-        reference_answer="",
-        generated_answer=generated_answer,
-        # max_chars=10000,
+        max_chars=None,
     )
 
     # -----------------------------------------------------
@@ -454,7 +385,7 @@ def run_one(
         "question": test["question"],
         "reference_answer": test["reference_answer"],
         "generated_answer": generated_answer,
-        "matched_employee_count": len(
+        "matched_group_count": len(
             grouped_evidence
         ),
         "answer_metrics": judge.model_dump(),
