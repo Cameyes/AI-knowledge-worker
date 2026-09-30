@@ -267,7 +267,7 @@ Keep feedback to one short sentence.
 
     judge_result = safe_completion_json(
         prompt,
-        max_tokens=256,
+        max_tokens=512,
         max_retries=3,
         fallback=None,
     )
@@ -332,6 +332,10 @@ def run_one(
         max_candidates_per_group=3,
         max_chars_per_candidate=3500,
     )
+
+    # print("\n===== CONSOLIDATED EVIDENCE =====")
+    # print(json.dumps(generation_evidence, indent=2, ensure_ascii=False))
+    # print("===== END CONSOLIDATED EVIDENCE =====\n")
 
     # print("\n===== GENERATION EVIDENCE =====")
     # print(json.dumps(generation_evidence, indent=2, ensure_ascii=False))
