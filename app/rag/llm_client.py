@@ -115,9 +115,11 @@
 
 # app/rag/llm_client.py
 
+import hashlib
 import json
 import os
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -126,6 +128,101 @@ from openai import OpenAI
 load_dotenv(override=True)
 
 DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
+
+
+# =========================================================
+# EVALUATION REPRODUCIBILITY
+# =========================================================
+
+_EVAL_DETERMINISTIC_ENV = "RAG_LLM_DETERMINISTIC"
+_EVAL_CACHE_ENV = "RAG_LLM_CACHE"
+_EVAL_CACHE_DIR_ENV = "RAG_LLM_CACHE_DIR"
+_DEFAULT_CACHE_DIR = Path(".rag_llm_cache")
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _evaluation_mode_enabled() -> bool:
+    return _env_flag(_EVAL_DETERMINISTIC_ENV)
+
+
+def _cache_enabled() -> bool:
+    return _evaluation_mode_enabled() and _env_flag(_EVAL_CACHE_ENV)
+
+
+def _cache_dir() -> Path:
+    configured = os.getenv(_EVAL_CACHE_DIR_ENV, "").strip()
+    return Path(configured) if configured else _DEFAULT_CACHE_DIR
+
+
+def _cache_path(
+    *,
+    prompt: str,
+    max_tokens: int,
+    json_mode: bool,
+    model: str,
+) -> Path:
+    payload = {
+        "model": model,
+        "json_mode": json_mode,
+        "max_tokens": max_tokens,
+        "prompt": prompt,
+        "temperature": 0.0 if _evaluation_mode_enabled() else None,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    return _cache_dir() / f"{digest}.json"
+
+
+def _load_cached_result(path: Path):
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+    if payload.get("version") != 1 or "result" not in payload:
+        return None
+
+    return payload["result"]
+
+
+def _store_cached_result(path: Path, result) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+
+    payload = {
+        "version": 1,
+        "result": result,
+    }
+
+    try:
+        with temp_path.open("w", encoding="utf-8") as file:
+            json.dump(
+                payload,
+                file,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        os.replace(temp_path, path)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # =========================================================
@@ -185,8 +282,23 @@ def _call_with_retry(
     max_retries: int,
     json_mode: bool,
 ):
-    client = _get_deepinfra_client()
     model = _get_model(json_mode)
+
+    cache_path = None
+    if _cache_enabled():
+        cache_path = _cache_path(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            model=model,
+        )
+
+        cached = _load_cached_result(cache_path)
+        if cached is not None:
+            print(f"[LLM CACHE HIT] {cache_path.name}")
+            return cached
+
+    client = _get_deepinfra_client()
 
     for attempt in range(max_retries):
 
@@ -202,6 +314,11 @@ def _call_with_retry(
                 ],
                 "max_tokens": max_tokens,
             }
+
+            if _evaluation_mode_enabled():
+                # DeepInfra documents temperature for GLM-5.3-Flash.
+                # Use greedy sampling during evaluation to reduce sampling variance.
+                kwargs["temperature"] = 0.0
 
             if json_mode:
                 kwargs["response_format"] = {
@@ -230,9 +347,14 @@ def _call_with_retry(
                 )
 
             if json_mode:
-                return json.loads(content)
+                result = json.loads(content)
+            else:
+                result = content.strip()
 
-            return content.strip()
+            if cache_path is not None:
+                _store_cached_result(cache_path, result)
+
+            return result
 
         except (
             ValueError,

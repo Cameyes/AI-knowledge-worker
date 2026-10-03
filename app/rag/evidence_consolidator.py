@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -34,6 +35,7 @@ ResolutionBasis = Literal[
     "declared_attribute_precedence",
     "temporal_current_precedence",
     "temporal_latest_state",
+    "llm_ambiguity_resolution",
 ]
 
 
@@ -47,6 +49,7 @@ class AtomicFact(BaseModel):
     statement: str
     attribute: str
     value: str
+    subject: str = ""
 
     value_type: Literal[
         "declared_attribute",
@@ -104,6 +107,20 @@ class TemporalStateVerificationResult(BaseModel):
     verdicts: list[TemporalStateVerdict] = Field(default_factory=list)
 
 
+class EntityScopeVerdict(BaseModel):
+    """Whether a retrieved candidate is about the requested target entity."""
+
+    verdict: Literal["match", "mismatch", "unknown"]
+
+
+class AmbiguityResolution(BaseModel):
+    """Closed-set semantic resolution for genuinely ambiguous extracted facts."""
+
+    verdict: Literal["resolved", "ambiguous", "insufficient"]
+    selected_fact_index: int | None = None
+    reason: str = ""
+
+
 class ConsolidationGroup(BaseModel):
     """Deterministic requirement-level consolidation result."""
 
@@ -143,6 +160,189 @@ def _salient_terms(text: str) -> list[str]:
         terms.append(token)
 
     return terms
+
+
+def _normalize_identity(text: str) -> str:
+    """Normalize an entity/document identity for exact generic matching."""
+    text = str(text or "").casefold()
+    text = re.sub(r"\.[a-z0-9]{1,8}$", "", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _source_basename(source: str) -> str:
+    cleaned = str(source or "").replace("\\", "/").strip()
+    return cleaned.rsplit("/", 1)[-1] if cleaned else ""
+
+
+def _candidate_identity_aliases(item: dict) -> list[str]:
+    """Return generic identity aliases from metadata, source name, and document heading."""
+    result = item.get("result", {})
+    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    aliases: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: object) -> None:
+        if not isinstance(value, str) or not value.strip():
+            return
+        normalized = _normalize_identity(value)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        aliases.append(value.strip())
+
+    for key in ("entity", "subject", "document_entity", "entity_name", "document_name"):
+        add(metadata.get(key))
+
+    source = metadata.get("source") or metadata.get("filename") or ""
+    filename = _source_basename(str(source))
+    if filename:
+        add(re.sub(r"\.[^.]+$", "", filename))
+
+    document = str(result.get("document", "")) if isinstance(result, dict) else ""
+    for line in document.splitlines()[:20]:
+        match = re.match(r"^\s*#\s+(.+?)\s*$", line)
+        if match:
+            add(match.group(1).strip(" #"))
+
+    return aliases
+
+
+def _candidate_identity(item: dict) -> str:
+    """Return the strongest available identity alias for display/fallback use."""
+    aliases = _candidate_identity_aliases(item)
+    return aliases[0] if aliases else ""
+
+
+def _infer_target_entities(group: str, items: list[dict]) -> list[str]:
+    """Infer explicit targets only when a candidate identity alias is named in the requirement."""
+    group_norm = _normalize_identity(group)
+    targets: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        for identity in _candidate_identity_aliases(item):
+            normalized = _normalize_identity(identity)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            if re.search(rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])", group_norm):
+                targets.append(identity)
+                break
+    return targets
+
+
+def _source_matches_targets(item: dict, target_entities: list[str]) -> str:
+    if not target_entities:
+        return "unscoped"
+
+    target_keys = {_normalize_identity(value) for value in target_entities}
+    aliases = _candidate_identity_aliases(item)
+    alias_keys = {_normalize_identity(value) for value in aliases}
+
+    # Explicit entity metadata is a hard identity assertion.
+    result = item.get("result", {})
+    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    explicit = []
+    for key in ("entity", "subject", "document_entity", "entity_name"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            explicit.append(_normalize_identity(value))
+
+    if explicit:
+        return "match" if any(value in target_keys for value in explicit) else "mismatch"
+
+    # Source filename/header is an identity anchor when it exactly matches the target.
+    if alias_keys & target_keys:
+        return "match"
+
+    # A non-matching filename is not automatically a mismatch: generic RAG sources
+    # may use opaque IDs. Let the narrow semantic verifier decide in that case.
+    return "unknown"
+
+
+def _build_entity_scope_verifier_prompt(group: str, target_entities: list[str], item: dict) -> str:
+    result = item.get("result", {})
+    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    source = metadata.get("source") or metadata.get("filename") or "Unknown source"
+    document = str(result.get("document", "")) if isinstance(result, dict) else ""
+    aliases = ", ".join(_candidate_identity_aliases(item)) or "none"
+    return f"""
+You are an entity-scope verification component for a general-purpose enterprise RAG system.
+
+Decide whether this candidate can be used for the explicitly requested target entity/entities.
+
+Requirement:
+{group}
+
+Target entity/entities:
+{', '.join(target_entities)}
+
+Source:
+{source}
+
+Candidate identity aliases:
+{aliases}
+
+Candidate evidence:
+{document[:1800]}
+
+Allowed verdicts:
+- match: the candidate contains the requested fact about a target entity.
+- mismatch: the candidate is about a different entity/entity set.
+- unknown: identity cannot be established reliably.
+
+Do not answer the requirement. Do not resolve values. Return JSON only:
+{{"verdict": "match"}}
+"""
+
+
+def _run_entity_scope_verifier(group: str, target_entities: list[str], item: dict) -> str:
+    raw = safe_completion_json(
+        _build_entity_scope_verifier_prompt(group, target_entities, item),
+        max_tokens=128,
+        max_retries=1,
+        fallback={"verdict": "unknown"},
+    )
+    try:
+        return EntityScopeVerdict.model_validate(raw).verdict
+    except Exception:
+        return "unknown"
+
+
+def _scope_candidates(group: str, items: list[dict], target_entities: list[str] | None = None) -> tuple[list[dict], list[dict], list[str], str]:
+    """Fail-closed entity firewall. Rejected candidates never reach resolution or generation."""
+    targets = [str(v).strip() for v in (target_entities or []) if str(v).strip()]
+    if not targets:
+        targets = _infer_target_entities(group, items)
+
+    if not targets:
+        return list(items), [], [], "unscoped"
+
+    accepted: list[dict] = []
+    rejected: list[dict] = []
+    unknown: list[dict] = []
+
+    for item in items:
+        classification = _source_matches_targets(item, targets)
+        if classification == "match":
+            accepted.append(item)
+        elif classification == "mismatch":
+            rejected.append(item)
+        else:
+            unknown.append(item)
+
+    # Ambiguous sources are the only candidates that receive semantic identity verification.
+    for item in unknown:
+        if _run_entity_scope_verifier(group, targets, item) == "match":
+            accepted.append(item)
+        else:
+            rejected.append(item)
+
+    return accepted, rejected, targets, "explicit"
 
 
 def _candidate_score(group: str, item: dict) -> float:
@@ -211,6 +411,7 @@ def _extractive_spans(group: str, items: list[dict]) -> list[dict]:
 
             spans.append({
                 "statement": cleaned,
+                "subject": _candidate_identity(items[index]),
                 "evidence_indices": [index],
                 "attribute": "",
                 "value": cleaned,
@@ -260,7 +461,9 @@ REQUIREMENT:
 Rules:
 1. Inspect every candidate independently.
 2. Extract a fact only when it is directly stated in a candidate.
-3. A fact may appear anywhere in the candidate: summary, history, table,
+3. For every fact, record `subject` as the entity the fact is actually about.
+   If the subject is not established, leave it empty; never copy the target from the requirement.
+4. A fact may appear anywhere in the candidate: summary, history, table,
    timeline, metadata, bullet list, or another structured section.
 4. Preserve exact names, values, dates, units, identifiers and qualifiers.
 5. Do not use outside knowledge.
@@ -329,6 +532,7 @@ Schema:
   "facts": [
     {{
       "statement": "direct factual statement",
+      "subject": "entity the fact is about or empty if unknown",
       "attribute": "normalized attribute",
       "value": "source-faithful value",
       "value_type": "declared_attribute",
@@ -1275,6 +1479,152 @@ def _resolve_requirement_facts(
     return "contradictory", None, None
 
 
+def _build_ambiguity_resolution_prompt(
+    requirement: str,
+    target_entities: list[str],
+    facts: list[AtomicFact],
+) -> str:
+    """Build a closed-set resolver prompt over already-extracted facts."""
+    serialized = []
+    for index, fact in enumerate(facts):
+        serialized.append(
+            {
+                "index": index,
+                "subject": fact.subject,
+                "attribute": fact.attribute,
+                "value": fact.value,
+                "value_type": fact.value_type,
+                "temporal_scope": fact.temporal_scope,
+                "effective_start": fact.effective_start,
+                "effective_end": fact.effective_end,
+                "effective_end_open": fact.effective_end_open,
+                "section_type": fact.section_type,
+                "statement": fact.statement,
+                "source_candidate_id": fact.source_candidate_id,
+            }
+        )
+
+    return f"""
+You are a closed-set ambiguity resolver for a general-purpose enterprise RAG system.
+
+Your job is ONLY to determine whether one of the already-extracted candidate facts
+resolves the requirement. You are NOT an answer generator and you MUST NOT invent,
+rewrite, combine, calculate, or infer a new factual value.
+
+REQUIREMENT:
+{requirement}
+
+TARGET ENTITY/ENTITIES:
+{', '.join(target_entities) if target_entities else 'not explicitly established'}
+
+CANDIDATE FACTS:
+{json.dumps(serialized, indent=2, ensure_ascii=False)}
+
+Rules:
+1. You may select ONLY one of the supplied fact indices.
+2. Never invent a value, subject, attribute, date, or qualification.
+3. The selected fact must answer the requested attribute and belong to the target
+   entity when a target entity is established.
+4. For current/latest requirements, distinguish historical facts from facts that
+   establish a continuing/current state.
+5. A dated state-changing fact can establish a continuing state when its text and
+   temporal metadata show that the value became effective and remained in force
+   until a later change.
+6. Historical values that ended before a later state are not current conflicts.
+7. A declared attribute can resolve an ambiguity when it is the strongest explicit
+   representation of the requested attribute and no stronger temporal fact conflicts.
+8. If two or more facts remain genuinely incompatible for the requested temporal
+   scope, return "ambiguous" rather than guessing.
+9. If none of the supplied facts answers the requirement, return "insufficient".
+10. Do not use outside knowledge.
+
+Return ONLY this JSON shape:
+{{
+  "verdict": "resolved | ambiguous | insufficient",
+  "selected_fact_index": integer_or_null,
+  "reason": "one short explanation"
+}}
+"""
+
+
+def _run_ambiguity_resolver(
+    requirement: str,
+    target_entities: list[str],
+    facts: list[AtomicFact],
+) -> AmbiguityResolution:
+    """Resolve ambiguity using only the closed set of already-extracted facts."""
+    if not facts:
+        return AmbiguityResolution(
+            verdict="insufficient",
+            selected_fact_index=None,
+            reason="No extracted facts are available for ambiguity resolution.",
+        )
+
+    raw = safe_completion_json(
+        _build_ambiguity_resolution_prompt(requirement, target_entities, facts),
+        max_tokens=512,
+        max_retries=2,
+        fallback={
+            "verdict": "ambiguous",
+            "selected_fact_index": None,
+            "reason": "Ambiguity resolver failed.",
+        },
+    )
+
+    try:
+        resolution = AmbiguityResolution.model_validate(raw)
+    except Exception:
+        return AmbiguityResolution(
+            verdict="ambiguous",
+            selected_fact_index=None,
+            reason="Ambiguity resolver returned an invalid structured result.",
+        )
+
+    if resolution.verdict != "resolved":
+        return resolution
+
+    index = resolution.selected_fact_index
+    if index is None or not 0 <= index < len(facts):
+        return AmbiguityResolution(
+            verdict="ambiguous",
+            selected_fact_index=None,
+            reason="Ambiguity resolver selected an invalid fact index.",
+        )
+
+    selected = facts[index]
+    target_keys = {_normalize_identity(value) for value in target_entities if value.strip()}
+    if target_keys and _normalize_identity(selected.subject) not in target_keys:
+        return AmbiguityResolution(
+            verdict="ambiguous",
+            selected_fact_index=None,
+            reason="Selected fact does not match the requested target entity.",
+        )
+
+    if not selected.attribute.strip() or not selected.value.strip():
+        return AmbiguityResolution(
+            verdict="ambiguous",
+            selected_fact_index=None,
+            reason="Selected fact lacks a usable attribute or value.",
+        )
+
+    return resolution
+
+
+def _should_run_ambiguity_resolver(
+    status: ConsolidationStatus,
+    facts: list[AtomicFact],
+    requirement: str,
+) -> bool:
+    """Gate the semantic resolver to unresolved cases with usable candidates."""
+    if status not in {"contradictory", "insufficient"}:
+        return False
+    if not facts:
+        return False
+    if not any(fact.attribute.strip() and fact.value.strip() for fact in facts):
+        return False
+    return True
+
+
 def _merge_extractive_fallback(
     model_result: dict,
     extractive_spans: list[dict],
@@ -1433,9 +1783,10 @@ def _run_extraction_rescue(
 def consolidate_evidence(
     grouped_evidence: dict[str, list[dict]],
     *,
-    max_candidates_per_group: int = 3,
+    max_candidates_per_group: int | None = None,
     max_chars_per_candidate: int = 3500,
     provenance_verifier_mode: str | None = None,
+    target_entities_by_group: dict[str, list[str]] | None = None,
 ) -> dict[str, dict]:
     """Consolidate retrieval evidence into requirement-scoped atomic facts.
 
@@ -1455,10 +1806,19 @@ def consolidate_evidence(
         verifier_mode = _DEFAULT_PROVENANCE_VERIFIER_MODE
 
     for group, items in grouped_evidence.items():
+        explicit_targets = None
+        if isinstance(target_entities_by_group, dict):
+            explicit_targets = target_entities_by_group.get(group)
+
+        scoped_items, rejected_items, target_entities, scope_status = _scope_candidates(
+            group, list(items), explicit_targets
+        )
+
+        rank_limit = len(scoped_items) if max_candidates_per_group is None else max_candidates_per_group
         ranked_items = _rank_candidates(
             group,
-            items,
-            max_candidates=max_candidates_per_group,
+            scoped_items,
+            max_candidates=max(0, rank_limit),
         )
 
         extractive = _extractive_spans(group, ranked_items)
@@ -1529,9 +1889,30 @@ def consolidate_evidence(
             if len(rescue_merged.get("facts", [])) > len(merged.get("facts", [])):
                 merged = rescue_merged
 
+        scoped_fact_data = []
+        target_keys = {_normalize_identity(value) for value in target_entities}
+        for fact_data in list(merged.get("facts", [])):
+            subject = _normalize_identity(str(fact_data.get("subject", "")))
+            if subject:
+                if subject in target_keys:
+                    scoped_fact_data.append(fact_data)
+                continue
+
+            # Legacy/extractive fact without a subject is accepted only from an
+            # exact source identity match. This is fail-closed for unknown sources.
+            indices = fact_data.get("evidence_indices", [])
+            trusted = any(
+                isinstance(index, int)
+                and 0 <= index < len(ranked_items)
+                and _normalize_identity(_candidate_identity(ranked_items[index])) in target_keys
+                for index in indices
+            ) if isinstance(indices, list) else False
+            if not target_entities or trusted:
+                scoped_fact_data.append(fact_data)
+
         verified_fact_data = _verify_provenance(
             group,
-            list(merged.get("facts", [])),
+            scoped_fact_data,
             ranked_items,
             verifier_mode,
         )
@@ -1548,6 +1929,34 @@ def consolidate_evidence(
             requirement=group,
         )
 
+        # Deterministic rules remain authoritative whenever they can resolve the
+        # requirement. The LLM is a closed-set fallback only for genuine ambiguity
+        # or conservative insufficiency with at least one usable extracted fact.
+        if _should_run_ambiguity_resolver(status, fact_models, group):
+            ambiguity = _run_ambiguity_resolver(
+                group,
+                target_entities,
+                fact_models,
+            )
+            if ambiguity.verdict == "resolved" and ambiguity.selected_fact_index is not None:
+                resolved_fact = fact_models[ambiguity.selected_fact_index]
+                status = "resolved"
+                resolution_basis = "llm_ambiguity_resolution"
+                llm_qualifiers = dict(resolved_fact.qualifiers or {})
+                llm_qualifiers["ambiguity_resolver"] = {
+                    "verdict": ambiguity.verdict,
+                    "selected_fact_index": ambiguity.selected_fact_index,
+                    "reason": ambiguity.reason,
+                }
+                resolved_fact = resolved_fact.model_copy(update={"qualifiers": llm_qualifiers})
+            else:
+                logger.info(
+                    "Ambiguity resolver did not resolve group=%r verdict=%s reason=%s",
+                    group,
+                    ambiguity.verdict,
+                    ambiguity.reason,
+                )
+
         consolidated[group] = {
             "group": group,
             "status": status,
@@ -1558,11 +1967,12 @@ def consolidate_evidence(
                 else None
             ),
             "facts": [fact.model_dump() for fact in fact_models],
-            # Keep the existing retrieval evidence contract for downstream
-            # callers. Phase 3 will teach generation how to consume the new
-            # resolution fields explicitly.
+            # Only identity-scoped evidence is exposed downstream.
             "evidence": merged.get("evidence", ranked_items),
-            "raw_candidates": ranked_items,
+            "raw_candidates": list(items),
+            "rejected_candidates": rejected_items,
+            "target_entities": target_entities,
+            "entity_scope_status": scope_status,
         }
 
     return consolidated

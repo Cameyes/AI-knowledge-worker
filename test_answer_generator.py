@@ -1,67 +1,84 @@
-from app.rag.answer_generator import generate_answer
+"""Regression test: insufficient consolidation must not expose raw candidates for guessing."""
+from __future__ import annotations
+
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+MODULE_PATH = ROOT / "answer_generator.py"
+
+app = types.ModuleType("app")
+rag = types.ModuleType("app.rag")
+llm = types.ModuleType("app.rag.llm_client")
+llm.safe_completion_text = lambda *args, **kwargs: kwargs.get("fallback", "")
+sys.modules.setdefault("app", app)
+sys.modules.setdefault("app.rag", rag)
+sys.modules.setdefault("app.rag.llm_client", llm)
+
+spec = importlib.util.spec_from_file_location("answer_generator_insufficient", MODULE_PATH)
+ag = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+sys.modules[spec.name] = ag
+spec.loader.exec_module(ag)
 
 
-query = (
-    "Which employee had a 2023 performance rating of 4.7/5 "
-    "and also received recognition for customer-related performance?"
-)
+def main():
+    captured = {}
+
+    def fake_completion(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
+        return "I could not determine the answer from the available evidence."
+
+    original = ag.safe_completion_text
+    ag.safe_completion_text = fake_completion
+
+    try:
+        evidence = {
+            "What is Jordan Blake's current job title?": {
+                "group": "What is Jordan Blake's current job title?",
+                "status": "insufficient",
+                "resolution_basis": None,
+                "resolved_fact": None,
+                "facts": [],
+                "evidence": [
+                    {
+                        "result": {
+                            "document": "Jordan Blake unrelated source text",
+                            "metadata": {"source": "Jordan Blake.md"},
+                        }
+                    },
+                    {
+                        "result": {
+                            "document": "Jordan K. Bishop unrelated source text",
+                            "metadata": {"source": "Jordan K. Bishop.md"},
+                        }
+                    },
+                ],
+                "raw_candidates": [],
+            }
+        }
+
+        result = ag.generate_answer(
+            "What is Jordan Blake's current job title?",
+            evidence,
+        )
+
+        assert result["sources"] == [
+            "Jordan Blake.md",
+            "Jordan K. Bishop.md",
+        ]
+        prompt = captured["prompt"]
+        assert "STATUS: insufficient" in prompt
+        assert "Jordan Blake unrelated source text" not in prompt
+        assert "Jordan K. Bishop unrelated source text" not in prompt
+        assert "available evidence is" in prompt.lower() and "insufficient" in prompt.lower()
+    finally:
+        ag.safe_completion_text = original
+
+    print("Insufficient-answer safety test: PASS")
 
 
-evidence = [
-    {
-        "subquery": (
-            "Which employee had a 2023 performance rating of 4.7/5?"
-        ),
-        "result": {
-            "document": """
-2023: Rating: 4.7/5
-
-Exceptional performance with highest client satisfaction
-scores in the team. Successfully expanded three key accounts.
-
-Recognition: Customer Champion Award 2023 for highest NPS scores
-""",
-            "metadata": {
-                "source": "Marcus Johnson.md"
-            },
-        },
-    },
-    {
-        "subquery": (
-            "Who received recognition for customer-related performance?"
-        ),
-        "result": {
-            "document": """
-2023: Rating: 4.7/5
-
-Recognition: Customer Champion Award 2023 for highest NPS scores
-""",
-            "metadata": {
-                "source": "Marcus Johnson.md"
-            },
-        },
-    },
-]
-
-
-result = generate_answer(
-    query,
-    evidence,
-)
-
-
-print("\n")
-print("=" * 80)
-print("FINAL ANSWER")
-print("=" * 80)
-
-print(result["answer"])
-
-
-print("\n")
-print("=" * 80)
-print("SOURCES")
-print("=" * 80)
-
-for source in result["sources"]:
-    print(source)
+if __name__ == "__main__":
+    main()

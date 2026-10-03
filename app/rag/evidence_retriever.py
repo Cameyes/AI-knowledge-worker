@@ -69,6 +69,37 @@ def _source_tokens(source: str) -> set[str]:
     )
 
 
+def _normalize_identity_phrase(text: str) -> str:
+    """Normalize an identity phrase for exact phrase matching."""
+    return re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^a-z0-9]+", " ", str(text).lower()),
+    ).strip()
+
+
+def _source_identity_phrase(source: str) -> str:
+    """Normalize the source basename for identity matching."""
+    normalized = str(source or "").replace("\\", "/")
+    basename = normalized.rsplit("/", 1)[-1]
+    stem = basename.rsplit(".", 1)[0]
+    return _normalize_identity_phrase(stem.replace("_", " ").replace("-", " "))
+
+
+def _source_exactly_matches_entity(source: str, entity: str) -> bool:
+    """Require a complete entity phrase; never treat one shared token as identity."""
+    entity_norm = _normalize_identity_phrase(entity)
+    source_norm = _source_identity_phrase(source)
+    if not entity_norm or not source_norm:
+        return False
+    return bool(
+        re.search(
+            rf"(?<![a-z0-9]){re.escape(entity_norm)}(?![a-z0-9])",
+            source_norm,
+        )
+    )
+
+
 def _source_query_overlap(
     query: str,
     source: str,
@@ -270,15 +301,25 @@ def _merge_duplicate_results(
     order = []
 
     for result in results:
-
         document = result.get("document", "")
+        metadata = result.get("metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        source = str(
+            metadata.get("filename")
+            or metadata.get("source")
+            or ""
+        ).strip()
 
-        if document not in merged:
-            merged[document] = result.copy()
-            order.append(document)
+        # Source identity is part of provenance. Identical chunk text from two
+        # different sources must remain two distinct candidates.
+        merge_key = (source, document)
+
+        if merge_key not in merged:
+            merged[merge_key] = result.copy()
+            order.append(merge_key)
             continue
 
-        existing = merged[document]
+        existing = merged[merge_key]
 
         # -----------------------------------------------------
         # Preserve global retrieval rank
@@ -380,8 +421,8 @@ def _merge_duplicate_results(
             existing["cross_subquery_source"] = True
 
     return [
-        merged[document]
-        for document in order
+        merged[key]
+        for key in order
     ]
 
 
@@ -391,17 +432,15 @@ def _entity_coverage_sources(
     source_records: dict[str, dict],
 ) -> list[str]:
     """
-    Identify source documents that plausibly correspond to an explicit
-    entity/concept from the structured decomposition.
+    Identify source documents with a strong full-phrase identity match.
 
-    The logic is generic: it compares normalized entity tokens with
-    source identifiers. If no identifier match exists, the highest-ranked
-    entity retrieval source is retained as a fallback anchor.
+    Partial token overlap is intentionally insufficient. This prevents
+    "Jordan Blake" from matching "Jordan K. Bishop" merely because both
+    contain the token "Jordan".
     """
-
-    entity_tokens = _normalize_terms(entity)
     ranked_sources: list[str] = []
     seen: set[str] = set()
+    target_norm = _normalize_identity_phrase(entity)
 
     def add(source: str | None) -> None:
         if not source or source in seen:
@@ -409,33 +448,47 @@ def _entity_coverage_sources(
         seen.add(source)
         ranked_sources.append(source)
 
+    # Explicit metadata identity is authoritative when present.
     for result in coverage_results:
         source = _get_source_filename(result)
         if not source:
             continue
 
-        source_tokens = _source_tokens(source)
-        if entity_tokens and entity_tokens & source_tokens:
+        metadata = result.get("metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+
+        explicit_values = [
+            metadata.get(key)
+            for key in ("entity", "subject", "document_entity", "entity_name")
+        ]
+        explicit_values = [
+            value for value in explicit_values
+            if isinstance(value, str) and value.strip()
+        ]
+
+        if explicit_values:
+            if any(
+                _normalize_identity_phrase(value) == target_norm
+                for value in explicit_values
+            ):
+                add(source)
+            continue
+
+        if _source_exactly_matches_entity(source, entity):
             add(source)
 
-    # Fallback: search the shared registry if the coverage retrieval
-    # result itself did not expose a filename-token match.
-    if not ranked_sources and entity_tokens:
-        candidates = []
-        for source, record in source_records.items():
-            overlap = len(entity_tokens & _source_tokens(source))
-            if overlap > 0:
-                candidates.append((overlap, record["best_global_rank"], source))
-        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-        for _, _, source in candidates[:1]:
-            add(source)
+    # Registry fallback uses the same exact-phrase rule.
+    if not ranked_sources:
+        for source, record in sorted(
+            source_records.items(),
+            key=lambda item: (item[1]["best_global_rank"], item[0]),
+        ):
+            if _source_exactly_matches_entity(source, entity):
+                add(source)
 
-    # Last-resort coverage anchor: the first source returned by the
-    # entity-only retrieval. It is still provenance-backed retrieval,
-    # never an invented source.
-    if not ranked_sources and coverage_results:
-        add(_get_source_filename(coverage_results[0]))
-
+    # Do not invent/force an arbitrary "required" source for opaque identifiers.
+    # The candidate remains available to normal retrieval and downstream
+    # identity verification.
     return ranked_sources
 
 

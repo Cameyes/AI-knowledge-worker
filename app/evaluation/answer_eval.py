@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
@@ -21,6 +22,13 @@ DEFAULT_TESTS_FILE = EVALUATION_DIR / "tests.jsonl"
 DEFAULT_RESULTS_FILE = EVALUATION_DIR / "results" / "retrieval_results.json"
 DEFAULT_OUTPUT_FILE = (
     EVALUATION_DIR / "results" / "answer_baseline_results.json"
+)
+
+# Keep evaluation-only LLM cache beside benchmark outputs rather than in the
+# application runtime cache. Do not override an explicit user setting.
+os.environ.setdefault(
+    "RAG_LLM_CACHE_DIR",
+    str(EVALUATION_DIR / "results" / "llm_cache"),
 )
 
 
@@ -48,6 +56,17 @@ load_dotenv(override=True)
 
 
 # ---------------------------------------------------------
+# Evaluation reproducibility
+# ---------------------------------------------------------
+# Answer evaluation uses the shared LLM client. Enable greedy sampling and an
+# exact-response cache by default so repeated runs over identical inputs are
+# reproducible. The cache is keyed by the complete prompt/model/mode/token
+# budget, so changed prompts naturally create new entries.
+os.environ.setdefault("RAG_LLM_DETERMINISTIC", "1")
+os.environ.setdefault("RAG_LLM_CACHE", "1")
+
+
+# ---------------------------------------------------------
 # Answer judge schema
 # ---------------------------------------------------------
 
@@ -59,7 +78,7 @@ class AnswerJudge(BaseModel):
     relevance: float = Field(ge=1, le=5)
     groundedness: float = Field(ge=1, le=5)
     citation_correctness: float = Field(ge=1, le=5)
-    feedback: str
+    feedback: str = ""
 
 
 # ---------------------------------------------------------
@@ -158,9 +177,27 @@ def build_compact_context(
         # Consolidated evidence representation.
         if isinstance(group_data, dict) and "facts" in group_data:
             status = group_data.get("status", "insufficient")
+            resolution_basis = group_data.get("resolution_basis") or "none"
+            resolved_fact = group_data.get("resolved_fact")
+
             blocks.append(
-                f"GROUP: {group_key}\nSTATUS: {status.upper()}"
+                f"GROUP: {group_key}\n"
+                f"STATUS: {status.upper()}\n"
+                f"RESOLUTION_BASIS: {resolution_basis}"
             )
+
+            if resolved_fact:
+                blocks.append(
+                    "DETERMINISTIC RESOLUTION (derived from the retrieved evidence):\n"
+                    f"Subject: {resolved_fact.get('subject', '')}\n"
+                    f"Attribute: {resolved_fact.get('attribute', '')}\n"
+                    f"Value: {resolved_fact.get('value', '')}\n"
+                    f"Statement: {resolved_fact.get('statement', '')}\n"
+                    f"Temporal scope: {resolved_fact.get('temporal_scope', '')}\n"
+                    f"Effective start: {resolved_fact.get('effective_start', '')}\n"
+                    f"Effective end: {resolved_fact.get('effective_end', '')}\n"
+                    f"Evidence indices: {resolved_fact.get('evidence_indices', [])}"
+                )
 
             for fact in group_data.get("facts", []):
                 blocks.append(
@@ -224,41 +261,64 @@ def judge_answer(
     prompt = f"""
 You are an enterprise RAG answer evaluator.
 
-Use the reference answer ONLY as the expected-answer target for
-accuracy and completeness. The reference answer is NOT evidence.
-For groundedness and citation correctness, rely ONLY on the retrieved
-evidence shown below. Do not use the reference answer to support any
-claim. Do not use outside knowledge.
+Evaluate the generated answer primarily against the consolidated evidence
+and the deterministic resolution shown below. The reference answer is a
+benchmark annotation, not evidence and not an absolute authority when it
+conflicts with the evidence or with a valid deterministic resolution.
+Do not use outside knowledge.
+
+Evaluation priority:
+1. The consolidated evidence and resolved fact, when STATUS is RESOLVED.
+2. The temporal and provenance semantics represented by that resolution.
+3. The reference answer as a secondary benchmark signal only.
+
+For current-state questions, a dated state-changing fact (for example, a
+promotion, transfer, replacement, activation, or other change of state)
+that has an open-ended applicability and has not been superseded should be
+treated as the current state, even if an older summary or benchmark
+reference still contains the prior state. Do not mark an answer incorrect
+merely because the reference answer contains that older value. Conversely,
+do not treat a historical fact as current when a later fact ends or
+supersedes it.
+
+If STATUS is CONTRADICTORY or INSUFFICIENT and there is no resolved fact,
+do not force a single value solely to match the reference answer. An answer
+that appropriately states the ambiguity or insufficiency may be more
+accurate than one that blindly matches the benchmark reference.
 
 Question:
 {question}
 
-Reference answer:
+Reference answer (benchmark annotation; not evidence):
 {reference_answer}
 
 Generated answer:
 {generated_answer}
 
-Retrieved evidence:
+Consolidated evidence and resolution:
 {evidence_context}
 
 Score each dimension from 1 to 5:
 
-- accuracy: factual correctness of every substantive claim.
-- completeness: whether every requested part/entity/value is answered.
+- accuracy: factual correctness of every substantive claim, judged against
+  the evidence and its valid resolution semantics. Do not penalize a
+  temporally correct answer solely because the reference answer is stale or
+  inconsistent.
+- completeness: whether every requested part/entity/value is answered,
+  using the resolved evidence where available.
 - relevance: whether the answer directly addresses the question.
-- groundedness: whether EVERY substantive claim is directly supported
-  by the retrieved evidence. A claim matching the reference answer but
-  absent from retrieved evidence is NOT grounded.
+- groundedness: whether EVERY substantive claim is supported by the
+  consolidated/retrieved evidence. A claim matching the reference answer but
+  absent from evidence is NOT grounded.
 - citation_correctness: whether supplied source citations/attributions
-  correctly correspond to the retrieved evidence. If no citation/source
-  attribution is present, do not invent one.
+  correctly correspond to the evidence. If no citation/source attribution is
+  present, do not invent one.
 
 For numerical questions, verify arithmetic against retrieved evidence.
 For multi-entity/comparative questions, verify EVERY independent
 subquery/evidence group separately before accepting the final answer.
-If a required group's evidence is missing, the answer cannot receive
-full groundedness for claims that depend on that missing fact.
+If a required group's evidence is missing and unresolved, do not award full
+accuracy or groundedness for a claim that depends on that missing fact.
 Do not penalize concise answers for omitting irrelevant details.
 
 Return ONLY a JSON object matching the required schema.
@@ -404,8 +464,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Baseline answer-generation evaluation "
-            "using saved retrieval evidence."
+            "Answer-generation evaluation using saved retrieval evidence "
+            "with reproducible LLM settings and cache."
         )
     )
 

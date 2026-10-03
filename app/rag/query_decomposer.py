@@ -6,7 +6,35 @@
 #     ]
 
 
+import re
+
 from app.rag.llm_client import safe_completion_json
+
+
+def _normalize_entity(text: str) -> str:
+    """Normalize an entity for duplicate/explicitness checks."""
+    return re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^a-z0-9]+", " ", str(text).lower()),
+    ).strip()
+
+
+def _entity_is_explicit(entity: str, requirement: str, original_query: str) -> bool:
+    """Accept an entity only when its complete phrase occurs in user input."""
+    entity_norm = _normalize_entity(entity)
+    if not entity_norm:
+        return False
+
+    for text in (requirement, original_query):
+        text_norm = _normalize_entity(text)
+        if re.search(
+            rf"(?<![a-z0-9]){re.escape(entity_norm)}(?![a-z0-9])",
+            text_norm,
+        ):
+            return True
+
+    return False
 
 
 def decompose_query_structured(query: str) -> list[dict]:
@@ -96,11 +124,23 @@ User query:
             entities = []
 
         cleaned_entities = []
+        seen_entity_keys = set()
+
         for entity in entities:
-            if isinstance(entity, str) and entity.strip():
-                value = entity.strip()
-                if value not in cleaned_entities:
-                    cleaned_entities.append(value)
+            if not isinstance(entity, str) or not entity.strip():
+                continue
+
+            value = entity.strip()
+            entity_key = _normalize_entity(value)
+
+            # Fail closed if the model invents or silently changes an entity.
+            if not entity_key or entity_key in seen_entity_keys:
+                continue
+            if not _entity_is_explicit(value, requirement.strip(), query):
+                continue
+
+            cleaned_entities.append(value)
+            seen_entity_keys.add(entity_key)
 
         cleaned.append({
             "requirement": requirement.strip(),
