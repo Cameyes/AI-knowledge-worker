@@ -427,6 +427,144 @@ def _extractive_spans(group: str, items: list[dict]) -> list[dict]:
     return spans
 
 
+
+
+def _requested_years(requirement: str) -> set[str]:
+    """Return explicit four-digit years requested by the requirement."""
+    return set(re.findall(r"\b(?:19|20)\d{2}\b", requirement))
+
+
+def _label_matches_requirement(label: str, requirement: str) -> bool:
+    """Use conservative lexical overlap to identify a requested field label."""
+    label_terms = set(_salient_terms(label))
+    requirement_terms = set(_salient_terms(requirement))
+    return bool(label_terms & requirement_terms)
+
+
+def _label_has_explicit_current_marker(label: str) -> bool:
+    """Return whether a field label explicitly denotes a current state/value."""
+    text = _normalized_compact(label)
+    return bool(re.search(r"\b(?:current|present|presently|ongoing|now)\b", text))
+
+
+def _structured_field_spans(group: str, items: list[dict]) -> list[dict]:
+    """Recover simple grounded key/value fields missed by model extraction.
+
+    The extractor is domain-neutral. It only emits an atomic fact when a
+    retrieved line visibly contains a field label whose terms overlap the
+    requested requirement. Dated nested labels are accepted only when the
+    requested year is explicit, preventing historical rows from being treated
+    as the current value merely because they contain a familiar field label.
+    """
+    spans: list[dict] = []
+    requested_years = _requested_years(group)
+
+    for index, item in enumerate(items):
+        result = item.get("result", {})
+        document = str(result.get("document", "")) if isinstance(result, dict) else ""
+        subject = _candidate_identity(item)
+
+        for raw_line in document.splitlines():
+            cleaned = _clean_markdown_text(raw_line)
+            if not cleaned:
+                continue
+
+            # Split nested forms such as:
+            #   Current Salary: $285,000
+            #   2023: Rating: 4.7/5
+            segments = [
+                part.strip()
+                for part in re.split(r"\s*:\s*", cleaned)
+                if part.strip()
+            ]
+            if len(segments) < 2 and "|" in cleaned:
+                segments = [
+                    part.strip()
+                    for part in re.split(r"\s*\|\s*", cleaned)
+                    if part.strip()
+                ]
+            if len(segments) < 2:
+                continue
+
+            selected: tuple[str, str] | None = None
+            selected_year = ""
+            has_date_prefix = False
+
+            for position in range(len(segments) - 1):
+                label = segments[position]
+                value = ":".join(segments[position + 1:]).strip()
+                if not value:
+                    continue
+
+                # A date prefix is temporal context, not the requested field.
+                # Only use it when that exact year was requested by the user.
+                date_match = re.fullmatch(_DATE_TOKEN_RE, label, re.IGNORECASE)
+                if date_match:
+                    has_date_prefix = True
+                    normalized_date = _normalize_date_token(label)
+                    if normalized_date and normalized_date[:4] in requested_years:
+                        selected_year = normalized_date
+                    continue
+
+                if _label_matches_requirement(label, group):
+                    selected = (label, value)
+
+            if selected is None:
+                continue
+
+            label, value = selected
+
+            # For current/latest questions, a plain static field such as
+            # "Job Title" must not be promoted into an additional current-state
+            # fact because a later history entry may supersede it. Explicit
+            # current/present labels remain eligible (for example,
+            # "Current Salary: $285,000").
+            temporal_intent = _query_temporal_intent(group)
+            if (
+                temporal_intent in {"current", "latest"}
+                and not _label_has_explicit_current_marker(label)
+            ):
+                continue
+
+            # A date-prefixed line is historical/scoped evidence. Do not use it
+            # as a fallback for an undated/current request unless the requested
+            # year is explicitly the same year carried by that line.
+            if has_date_prefix and not selected_year:
+                continue
+
+            if selected_year and selected_year[:4] not in requested_years:
+                continue
+
+            # A simple two-part field is an actual key/value declaration. A
+            # nested dated field is kept provenance-neutral because its date
+            # prefix scopes the value rather than declaring the attribute.
+            direct_field = len(segments) == 2 and not selected_year
+            value_type = "declared_attribute" if direct_field else "unknown"
+
+            qualifiers: dict[str, Any] = {"structured_rescue": True}
+            if selected_year:
+                qualifiers["effective_start"] = selected_year
+
+            spans.append({
+                "statement": cleaned,
+                "subject": subject,
+                "evidence_indices": [index],
+                "attribute": label,
+                "value": value,
+                "value_type": value_type,
+                "temporal_scope": "historical" if selected_year else "unknown",
+                "effective_start": selected_year,
+                "effective_end": "",
+                "effective_end_open": False,
+                "section_type": "unknown",
+                "source_candidate_id": f"candidate:{index}",
+                "source_line": cleaned if direct_field else "",
+                "declaration_label": label if direct_field else "",
+                "qualifiers": qualifiers,
+            })
+
+    return spans
+
 def _build_group_prompt(
     group: str,
     items: list[dict],
@@ -1822,6 +1960,7 @@ def consolidate_evidence(
         )
 
         extractive = _extractive_spans(group, ranked_items)
+        structured_rescue = _structured_field_spans(group, ranked_items)
 
         prompt = _build_group_prompt(
             group,
@@ -1844,7 +1983,7 @@ def consolidate_evidence(
         model_result = _normalize_model_result(group, ranked_items, raw)
         merged = _merge_extractive_fallback(
             model_result,
-            extractive,
+            extractive + structured_rescue,
             ranked_items,
         )
 

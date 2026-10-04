@@ -393,13 +393,8 @@ def run_one(
         max_chars_per_candidate=3500,
     )
 
-    # print("\n===== CONSOLIDATED EVIDENCE =====")
-    # print(json.dumps(generation_evidence, indent=2, ensure_ascii=False))
-    # print("===== END CONSOLIDATED EVIDENCE =====\n")
 
-    # print("\n===== GENERATION EVIDENCE =====")
-    # print(json.dumps(generation_evidence, indent=2, ensure_ascii=False))
-    # print("===== END GENERATION EVIDENCE =====\n")
+    
 
     # -----------------------------------------------------
     # Generate answer

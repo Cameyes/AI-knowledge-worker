@@ -147,8 +147,124 @@ User query:
             "entities": cleaned_entities,
         })
 
-    return cleaned or [{"requirement": query, "entities": []}]
+    cleaned = cleaned or [{"requirement": query, "entities": []}]
 
+    # Fail closed on LLM grouping errors: independent named entities must not
+    # silently share one retrieval/consolidation group.
+    return _split_multi_entity_requirements(cleaned)
+
+
+
+_MULTI_ENTITY_COMPARISON_PATTERNS = (
+    r"\bamong\b",
+    r"\bhighest\b",
+    r"\blowest\b",
+    r"\bmaximum\b",
+    r"\bminimum\b",
+    r"\bmost\b",
+    r"\bleast\b",
+    r"\bfirst\b",
+    r"\blast\b",
+    r"\btop\b",
+    r"\bbottom\b",
+    r"\bwinner\b",
+    r"\bwinners\b",
+    r"\bdifference\b",
+    r"\bcompare\b",
+    r"\bcomparison\b",
+)
+
+
+_RELATIONSHIP_PATTERNS = (
+    r"\brelationship\s+between\b",
+    r"\bconnection\s+between\b",
+    r"\bassociation\s+between\b",
+    r"\binteraction\s+between\b",
+    r"\bdependency\s+between\b",
+    r"\bintegration\s+between\b",
+    r"\bcollaboration\s+between\b",
+    r"\bcommunication\s+between\b",
+)
+
+
+def _is_relationship_requirement(requirement: str) -> bool:
+    text = requirement.casefold()
+    return any(re.search(pattern, text) for pattern in _RELATIONSHIP_PATTERNS)
+
+
+def _should_split_multi_entity_requirement(
+    requirement: str,
+    entities: list[str],
+) -> bool:
+    """Identify multi-entity requests that need independent retrieval groups.
+
+    Relationship-style questions remain intact. Collection/comparison requests
+    are split because retrieval and consolidation must resolve each entity
+    independently before a downstream answer step can compare or combine them.
+    """
+    if len(entities) <= 1:
+        return False
+
+    if _is_relationship_requirement(requirement):
+        return False
+
+    text = requirement.casefold()
+
+    if any(re.search(pattern, text) for pattern in _MULTI_ENTITY_COMPARISON_PATTERNS):
+        return True
+
+    collection_pattern = re.compile(
+        r"\b(?:what|which|where|when)\b\s+"
+        r"[^?]*\b(?:are|were|is|was)\b[^?]*\bof\b",
+        re.IGNORECASE,
+    )
+    if collection_pattern.search(requirement):
+        return True
+
+    behavior_pattern = re.compile(
+        r"\b(?:what|which)\b[^?]*\b(?:do|does|use|manage|hold|have|has)\b",
+        re.IGNORECASE,
+    )
+    return bool(behavior_pattern.search(requirement))
+
+
+def _split_multi_entity_requirements(
+    requirements: list[dict],
+) -> list[dict]:
+    """Prevent an otherwise valid multi-entity item from becoming one group."""
+    expanded: list[dict] = []
+
+    for item in requirements:
+        requirement = str(item.get("requirement", "")).strip()
+        entities = item.get("entities", [])
+        if not requirement or not isinstance(entities, list):
+            continue
+
+        clean_entities = [
+            str(entity).strip()
+            for entity in entities
+            if isinstance(entity, str) and entity.strip()
+        ]
+
+        if not _should_split_multi_entity_requirement(requirement, clean_entities):
+            expanded.append({
+                "requirement": requirement,
+                "entities": clean_entities,
+            })
+            continue
+
+        for entity in clean_entities:
+            expanded.append({
+                "requirement": (
+                    f"{requirement}\n"
+                    f"Target entity: {entity}. Retrieve only the requested factual "
+                    "value for this entity; do not compare or combine it with the "
+                    "other named entities."
+                ),
+                "entities": [entity],
+            })
+
+    return expanded
 
 def decompose_query(query: str) -> list[str]:
     """Backward-compatible string-only decomposition API."""

@@ -39,6 +39,7 @@ TEST_FILE = EVALUATION_DIR / "tests.jsonl"
 
 RESULTS_DIR = EVALUATION_DIR / "results"
 RESULTS_FILE = RESULTS_DIR / "retrieval_results.json"
+RAW_RESULTS_FILE = RESULTS_DIR / "raw_retrieval_results.json"
 
 
 # ---------------------------------------------------------
@@ -100,6 +101,46 @@ def save_cached_results(results: dict[int, dict]):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            results,
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+# ---------------------------------------------------------
+# Raw retrieval cache
+# ---------------------------------------------------------
+
+def load_raw_results() -> dict[int, dict]:
+    """
+    Load raw grouped retrieval results.
+
+    Unlike retrieval_results.json, this preserves the exact
+    evidence groups returned by multi_evidence_retrieve(),
+    including subquery and entity metadata.
+    """
+
+    if not RAW_RESULTS_FILE.exists():
+        return {}
+
+    with open(RAW_RESULTS_FILE, "r", encoding="utf-8") as f:
+        return {
+            int(key): value
+            for key, value in json.load(f).items()
+        }
+
+
+def save_raw_results(results: dict[int, dict]):
+    """
+    Persist raw grouped retrieval results without altering
+    the existing retrieval-results cache contract.
+    """
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(RAW_RESULTS_FILE, "w", encoding="utf-8") as f:
         json.dump(
             results,
             f,
@@ -176,7 +217,7 @@ def evaluate_retrieval(
     retrieval_top_k: int = 30,
     rerank_top_k: int = 10,
     metric_k: int = 10,
-) -> EvaluationResult:
+) -> tuple[EvaluationResult, list[dict]]:
 
     start_time = time.perf_counter()
 
@@ -395,7 +436,7 @@ def evaluate_retrieval(
         subquery_coverage=subquery_coverage,
         latency_ms=latency_ms,
         passed=True,
-    )
+    ), evidence
 
 
 # ---------------------------------------------------------
@@ -465,6 +506,7 @@ def main():
         selected_tests = [(0, tests[0])]
 
     cached_results = load_cached_results()
+    raw_results = load_raw_results()
 
     total = len(selected_tests)
 
@@ -502,11 +544,18 @@ def main():
 
         try:
 
-            result = evaluate_retrieval(test)
+            result, raw_evidence = evaluate_retrieval(test)
 
             cached_results[index] = result.model_dump()
 
+            raw_results[index] = {
+                "question": test.question,
+                "category": test.category,
+                "evidence": raw_evidence,
+            }
+
             save_cached_results(cached_results)
+            save_raw_results(raw_results)
 
             print("\nSubquery metrics:")
 
