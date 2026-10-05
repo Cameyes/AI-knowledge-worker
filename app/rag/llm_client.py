@@ -137,6 +137,11 @@ DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
 _EVAL_DETERMINISTIC_ENV = "RAG_LLM_DETERMINISTIC"
 _EVAL_CACHE_ENV = "RAG_LLM_CACHE"
 _EVAL_CACHE_DIR_ENV = "RAG_LLM_CACHE_DIR"
+# Optional global salt. Changing it invalidates every cached response without
+# deleting files. Per-call namespaces (a prompt-contract version) are also
+# supported. Both are omitted from the key when empty, so existing cache entries
+# keep working for callers that do not use them.
+_EVAL_CACHE_NAMESPACE_ENV = "RAG_LLM_CACHE_NAMESPACE"
 _DEFAULT_CACHE_DIR = Path(".rag_llm_cache")
 
 
@@ -168,6 +173,7 @@ def _cache_path(
     max_tokens: int,
     json_mode: bool,
     model: str,
+    namespace: str = "",
 ) -> Path:
     payload = {
         "model": model,
@@ -176,6 +182,16 @@ def _cache_path(
         "prompt": prompt,
         "temperature": 0.0 if _evaluation_mode_enabled() else None,
     }
+    effective_namespace = "|".join(
+        part
+        for part in (
+            os.getenv(_EVAL_CACHE_NAMESPACE_ENV, "").strip(),
+            (namespace or "").strip(),
+        )
+        if part
+    )
+    if effective_namespace:
+        payload["namespace"] = effective_namespace
     digest = hashlib.sha256(
         json.dumps(
             payload,
@@ -281,6 +297,7 @@ def _call_with_retry(
     max_tokens: int,
     max_retries: int,
     json_mode: bool,
+    cache_namespace: str = "",
 ):
     model = _get_model(json_mode)
 
@@ -291,6 +308,7 @@ def _call_with_retry(
             max_tokens=max_tokens,
             json_mode=json_mode,
             model=model,
+            namespace=cache_namespace,
         )
 
         cached = _load_cached_result(cache_path)
@@ -411,6 +429,7 @@ def safe_completion_text(
         "I could not generate an answer "
         "due to a temporary service issue."
     ),
+    cache_namespace: str = "",
 ) -> str:
 
     result = _call_with_retry(
@@ -418,6 +437,7 @@ def safe_completion_text(
         max_tokens=max_tokens,
         max_retries=max_retries,
         json_mode=False,
+        cache_namespace=cache_namespace,
     )
 
     if result is None:
@@ -439,6 +459,7 @@ def safe_completion_json(
     max_tokens: int = 256,
     max_retries: int = 3,
     fallback: dict | None = None,
+    cache_namespace: str = "",
 ) -> dict:
 
     result = _call_with_retry(
@@ -446,6 +467,7 @@ def safe_completion_json(
         max_tokens=max_tokens,
         max_retries=max_retries,
         json_mode=True,
+        cache_namespace=cache_namespace,
     )
 
     if result is None:

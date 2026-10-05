@@ -1528,7 +1528,7 @@ def _resolve_requirement_facts(
     # extraction produces unrelated attributes, do not guess which one the
     # resolver should select.
     if len(non_empty_attributes) > 1:
-        return "contradictory", None, None
+        return "supported", None, None
 
     value_keys = _distinct_value_keys(resolvable_facts)
 

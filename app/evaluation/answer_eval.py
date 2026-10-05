@@ -95,6 +95,19 @@ def load_tests(path: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------
+# Generation evidence budget
+# ---------------------------------------------------------
+# Candidates handed to the consolidator per group (scoped, then ranked, then cut
+# to GENERATION_CANDIDATES_PER_GROUP). Set RAG_ANSWER_CANDIDATE_POOL=3 to
+# reproduce the previous cut-before-scope behavior exactly.
+GENERATION_CANDIDATES_PER_GROUP = 3
+CANDIDATE_POOL_PER_GROUP = max(
+    GENERATION_CANDIDATES_PER_GROUP,
+    int(os.getenv("RAG_ANSWER_CANDIDATE_POOL", "6")),
+)
+
+
+# ---------------------------------------------------------
 # Domain-agnostic evidence reconstruction
 # ---------------------------------------------------------
 
@@ -151,6 +164,12 @@ def select_evidence_by_subquery(
     Retrieval already supplies ranked evidence for each subquery, so
     baseline evaluation must not replace that ranking with lexical
     heuristics or cross-group selection.
+
+    NOTE: this is a candidate POOL, not the final generation budget. The
+    consolidator applies its entity-scope firewall to the whole pool first and
+    only then keeps its top ``max_candidates_per_group``. Cutting to the final
+    budget here (before the firewall) lets other entities' chunks consume the
+    slots that the target entity's own chunks needed.
     """
 
     return {
@@ -382,14 +401,14 @@ def run_one(
 
     generation_evidence = select_evidence_by_subquery(
         grouped_evidence,
-        max_items_per_group=3,
+        max_items_per_group=CANDIDATE_POOL_PER_GROUP,
     )
 
     # Convert retrieved chunks into atomic, requirement-scoped facts
     # before generation. No new evidence is created here.
     generation_evidence = consolidate_evidence(
         generation_evidence,
-        max_candidates_per_group=3,
+        max_candidates_per_group=GENERATION_CANDIDATES_PER_GROUP,
         max_chars_per_candidate=3500,
     )
 
@@ -439,16 +458,17 @@ def run_one(
     )
 
     return {
-        "test_number": test_number,
-        "category": test["category"],
-        "question": test["question"],
-        "reference_answer": test["reference_answer"],
-        "generated_answer": generated_answer,
-        "matched_group_count": len(
-            grouped_evidence
-        ),
-        "answer_metrics": judge.model_dump(),
-    }
+    "test_number": test_number,
+    "category": test["category"],
+    "question": test["question"],
+    "reference_answer": test["reference_answer"],
+    "generated_answer": generated_answer,
+    "matched_group_count": len(
+        grouped_evidence
+    ),
+    "generation_audit": answer_result.get("audit", {}),
+    "answer_metrics": judge.model_dump(),
+}
 
 
 # ---------------------------------------------------------

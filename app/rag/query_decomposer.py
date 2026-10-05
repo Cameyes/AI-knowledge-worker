@@ -37,6 +37,116 @@ def _entity_is_explicit(entity: str, requirement: str, original_query: str) -> b
     return False
 
 
+def _validate_entity_roles(
+    query: str,
+    requirements: list[dict],
+) -> list[dict]:
+    """Semantically validate model-emitted entities without domain-specific rules.
+
+    The decomposer may return phrases that literally occur in the query but are
+    actually attributes, values, dates, actions, or other constraints. This
+    closed-set validation keeps only phrases the model identifies as true
+    retrieval targets for their requirement.
+    """
+    validated: list[dict] = []
+
+    for item in requirements:
+        requirement = item.get("requirement", "")
+        entities = item.get("entities", [])
+
+        if not requirement or not isinstance(entities, list) or not entities:
+            validated.append(item)
+            continue
+
+        candidates = [
+            value.strip()
+            for value in entities
+            if isinstance(value, str) and value.strip()
+        ]
+        if not candidates:
+            validated.append({
+                "requirement": requirement,
+                "entities": [],
+            })
+            continue
+
+        prompt = f"""
+You are validating entity roles for a general-purpose query decomposition system.
+This is a closed-set classification task. Do not invent, rewrite, merge, or add
+entities.
+
+User query:
+{query}
+
+Requirement:
+{requirement}
+
+Candidate phrases:
+{candidates}
+
+For each candidate, classify whether it is a true retrieval TARGET ENTITY for
+this requirement. A target entity is a referential thing the requirement is
+about and that could be independently identified/retrieved, such as a person,
+organization, product, project, document, location, object, or other explicit
+target.
+
+Do NOT classify a candidate as an entity when it is functioning only as an
+attribute, field name, date/time, number/value, measure, category, action,
+relationship word, or other constraint on the target.
+
+Return ONLY JSON in exactly this form:
+{{
+  "verdicts": [
+    {{"candidate": "EXACT CANDIDATE TEXT", "is_entity": true}}
+  ]
+}}
+
+Rules:
+1. Use only the supplied candidates.
+2. Preserve candidate text exactly.
+3. `is_entity` must be true only for candidates functioning as retrieval targets
+   in this requirement.
+4. Do not infer a missing entity from context.
+"""
+
+        data = safe_completion_json(
+            prompt,
+            max_tokens=384,
+            max_retries=1,
+            fallback={"verdicts": []},
+        )
+
+        verdicts = data.get("verdicts", []) if isinstance(data, dict) else []
+        allowed = set(candidates)
+        verdict_map: dict[str, bool] = {}
+
+        if isinstance(verdicts, list):
+            for verdict in verdicts:
+                if not isinstance(verdict, dict):
+                    continue
+                candidate = verdict.get("candidate")
+                is_entity = verdict.get("is_entity")
+                if (
+                    isinstance(candidate, str)
+                    and candidate in allowed
+                    and isinstance(is_entity, bool)
+                ):
+                    verdict_map[candidate] = is_entity
+
+        filtered = [
+            candidate
+            for candidate in candidates
+            if verdict_map.get(candidate, False)
+        ]
+
+        validated.append({
+            "requirement": requirement,
+            "entities": filtered,
+        })
+
+    return validated
+
+
 def decompose_query_structured(query: str) -> list[dict]:
     """
     Decompose a query into independent, domain-agnostic evidence
@@ -149,7 +259,11 @@ User query:
 
     cleaned = cleaned or [{"requirement": query, "entities": []}]
 
-    # Fail closed on LLM grouping errors: independent named entities must not
+    # Semantically distinguish retrieval targets from attributes, values, dates,
+    # actions, and other constraints. This is intentionally domain-agnostic.
+    cleaned = _validate_entity_roles(query, cleaned)
+
+    # Fail closed on LLM grouping errors: independent target entities must not
     # silently share one retrieval/consolidation group.
     return _split_multi_entity_requirements(cleaned)
 
